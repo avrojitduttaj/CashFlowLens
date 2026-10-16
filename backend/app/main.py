@@ -19,6 +19,11 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
+from app.payment_risk import (
+    benchmark_models,
+    predict_unpaid_invoices,
+    prepare_labeled_history,
+)
 
 load_dotenv()
 ROOT = Path(__file__).resolve().parents[1]
@@ -260,3 +265,49 @@ async def explain(request: ExplainRequest, user: AuthUser = Depends(current_user
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="Local Ollama is unavailable. Start Ollama and pull the configured Gemma model, or use analytics without AI.") from exc
     return {"model": model, "explanation": str(payload.get("response", "")).strip(), "local_inference": True}
+
+
+@app.post("/api/payment-risk/upload")
+async def payment_risk_upload(
+    file: UploadFile = File(...),
+    user: AuthUser = Depends(current_user),
+) -> dict[str, Any]:
+    """
+    Experimental payment-delay benchmark and predictions.
+
+    Upload a CSV/XLSX with historical paid invoices
+    (including paid_date) and current unpaid invoices.
+    """
+    if not file.filename or not file.filename.lower().endswith(
+        (".csv", ".xlsx", ".xls")
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail="Upload a CSV or Excel invoice file.",
+        )
+
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds the 8 MB limit.",
+        )
+
+    frame = parse_upload(raw, file.filename)
+
+    # Training labels come only from historical paid invoices.
+    X, y = prepare_labeled_history(frame)
+    benchmark = benchmark_models(X, y)
+
+    # TabPFN predictions are optional. Analytics remains available
+    # when there is insufficient data or TabPFN is unavailable.
+    predictions = predict_unpaid_invoices(frame, frame)
+
+    return {
+        "benchmark": benchmark,
+        "payment_risk": predictions,
+        "notice": (
+            "Experimental estimates only. These are not "
+            "guarantees of payment or financial advice."
+        ),
+    }
