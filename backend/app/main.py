@@ -250,7 +250,7 @@ async def analytics_upload(file: UploadFile = File(...), user: AuthUser = Depend
 
 
 @app.post("/api/explain")
-async def explain(request: ExplainRequest, user: AuthUser = Depends(current_user)) -> dict[str, str]:
+async def explain(request: ExplainRequest, user: AuthUser = Depends(current_user)) -> dict[str, str | bool]:
     """Optional local Gemma explanation. Send aggregated figures, not raw invoices."""
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     model = request.model or os.getenv("OLLAMA_MODEL", "gemma3:4b")
@@ -258,13 +258,22 @@ async def explain(request: ExplainRequest, user: AuthUser = Depends(current_user
               "Do not make guarantees or provide financial advice. Distinguish facts from possibilities, mention small-sample uncertainty, and give at most three practical next steps. "
               f"Aggregated figures: {request.summary}")
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
             response = await client.post(f"{base_url}/api/generate", json={"model": model, "prompt": prompt, "stream": False})
             response.raise_for_status()
             payload = response.json()
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="Local Ollama is unavailable. Start Ollama and pull the configured Gemma model, or use analytics without AI.") from exc
-    return {"model": model, "explanation": str(payload.get("response", "")).strip(), "local_inference": True}
+        print(f"Ollama HTTP error: {type(exc).__name__}: {exc}", flush=True)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama request failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    return {
+    "model": model,
+    "explanation": str(payload.get("response", "")).strip(),
+    "local_inference": "true",
+    "notice": "This is an optional local Gemma explanation. It is not a guarantee of payment or financial advice.",
+    }
 
 
 @app.post("/api/payment-risk/upload")
