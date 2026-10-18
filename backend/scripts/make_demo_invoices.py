@@ -7,7 +7,7 @@ OUTPUT = Path(__file__).resolve().parent.parent / "sample-data" / "demo_invoices
 OUTPUT.parent.mkdir(parents=True, exist_ok=True)
 
 rows = []
-start = date(2025, 1, 1)
+start = date.today() - timedelta(days=270)
 
 for i in range(80):
     invoice_date = start + timedelta(days=i * 4)

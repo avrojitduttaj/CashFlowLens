@@ -1,8 +1,26 @@
-# CashFlowLens
+# CashFlowLens — your local AI cash-flow copilot
 
-**Know what is coming in. Spot what is slipping. Follow up with confidence.**
+**Turn invoice totals into grounded next steps with Gemma running on your machine.**
 
-CashFlowLens is a local-first cash-flow companion for freelancers and micro-agencies. Create an account, upload a CSV or Excel invoice export, and the API validates the data and calculates outstanding invoices, overdue balances, due-date-based inflows, and descriptive client payment-delay signals. An optional local Ollama/Gemma integration can explain aggregate results.
+CashFlowLens is a local-first cash-flow copilot for freelancers and small agencies. Upload a real CSV or Excel invoice export: deterministic analytics calculate receivables and due-date-based inflows, then a local open-weight Gemma model automatically turns privacy-filtered aggregates into a concise cash-flow brief and practical follow-ups. AI interpretation is the product's core workflow; the model does not calculate or change financial totals.
+
+The API reduces verified totals and payment history to qualitative state signals before sending them to the local model; exact amounts, counts, client names, invoice identifiers, contact details, dates, and raw invoice rows are excluded from the prompt. Gemma selects only from server-allowlisted focus and action IDs, and the server renders the final brief from fixed text rather than trusting free-form model claims. Inference is restricted to loopback Ollama addresses and cloud model aliases are rejected. Invoice uploads are analyzed in request memory and are not persisted by the API.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Real CSV or Excel invoice export] --> B[Authenticated FastAPI upload]
+    B --> C[Deterministic analytics and validation]
+    C --> D[React cash-flow dashboard]
+    C --> E[Derive qualitative signals]
+    E --> F[Local Ollama + open-weight Gemma]
+    F --> G[Grounded cash-flow brief and next steps]
+    G --> D
+    B --> H[(SQLite user accounts only)]
+```
+
+Gemma contributes the interpretation and next-step brief after every successful upload; it is not a decorative chatbot or cloud API call. Deterministic calculations remain the financial source of truth. The API derives qualitative signals server-side and sends only those signals to the configured local Ollama runtime.
 
 > **MVP/security note:** This is a development prototype, not production-ready financial software. Authentication uses a custom signed bearer token and PBKDF2 password hashes. Set a strong `CASHFLOWLENS_TOKEN_SECRET`, use HTTPS, add rate limiting, CSRF-safe deployment architecture, account recovery, and security review before public launch. Do not upload real financial data to a public deployment until its data handling has been reviewed.
 
@@ -13,10 +31,14 @@ CashFlowLens is a local-first cash-flow companion for freelancers and micro-agen
 - Authenticated CSV / XLSX / XLS upload (8 MB limit)
 - Server-side schema validation and deterministic invoice analytics
 - Dynamic dashboard based on the uploaded file, not hardcoded sample metrics
+- Automatic local Gemma cash-flow brief after each successful invoice upload
+- Qualitative prompt allowlist: exact amounts, client names, and invoice-level data never reach the model; structured model choices are allowlisted and rendered as vetted copy
+- Clear local-model loading, retry, and unavailable states; deterministic accounting stays visible if Ollama is offline
 - Expected inflows by due date for the next 30 days
 - Client payment-delay summaries based on paid invoices with a paid date
+- Optional experimental payment-risk estimates for unpaid invoices, based on labeled history in the uploaded file
 - Follow-up email drafts for unpaid invoices
-- Optional Gemma explanation endpoint, using aggregated metrics rather than raw invoice rows
+- Local Gemma explanation endpoint, using qualitative signals rather than raw invoice rows and requiring a loopback Ollama endpoint
 - Invoice file content is analyzed in request memory and is not saved by the API; user accounts are stored in SQLite
 
 ## Run locally
@@ -49,9 +71,17 @@ npm run dev
 
 Open the Vite URL (normally `http://localhost:5173`). Optionally set `VITE_API_URL` in `frontend/.env` if the API is not at `http://localhost:8000`.
 
-### 3. Optional local Gemma
+### 3. Local Gemma (required for the AI cash-flow brief)
 
-Install Ollama separately, pull a Gemma model (default `gemma3:4b`), and make sure Ollama is reachable at `OLLAMA_BASE_URL`. Core upload and analytics work without AI. The UI's “Explain with Gemma” action will report a clear service error if Ollama is unavailable.
+Install and start [Ollama](https://ollama.com/) on the same machine as the API, then download the default open-weight model:
+
+```bash
+ollama pull gemma3:4b
+```
+
+Ollama's default address is `http://127.0.0.1:11434`; the API uses `gemma3:4b` unless configured otherwise. To customize, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL` in `backend/.env` before starting the API. The AI brief runs automatically after each successful invoice upload and can be regenerated from the dashboard. If Ollama is unavailable, the UI reports the error and keeps the deterministic financial calculations available.
+
+The model runs locally; it is not bundled with this repository and must be downloaded before a complete demo. For a live demonstration, start Ollama and the API on the demo machine, upload the supplied sample CSV, and show the real generated brief alongside the deterministic figures. Do not present a mocked or prewritten AI response as live model output.
 
 ## File format
 
@@ -65,7 +95,7 @@ Required columns (case-insensitive; spaces in headers are converted to underscor
 
 Optional: `invoice_id`, `paid_date`. Some common aliases such as `client_name`, `customer`, `invoice_number`, `total`, `invoice_amount`, `payment_status`, `paid_on`, and `payment_date` are recognized. ISO dates (`YYYY-MM-DD`) are recommended. Statuses `paid`, `complete`, or `completed` are treated as paid; a valid `paid_date` also marks an invoice as paid.
 
-A sample file is available at `sample-data/invoices.csv` and through the app's upload empty state.
+A sample file is available at `sample-data/invoices.csv` and through the app's upload empty state. For the live demo, `backend/sample-data/demo_invoices.csv` is generated with dates relative to today and includes historical paid invoices plus overdue and upcoming unpaid invoices; regenerate it with `python backend/scripts/make_demo_invoices.py`.
 
 ## API overview
 
@@ -74,7 +104,8 @@ A sample file is available at `sample-data/invoices.csv` and through the app's u
 - `POST /api/auth/login` — authenticate
 - `GET /api/auth/me` — current user (Bearer token)
 - `POST /api/analytics/upload` — authenticated CSV/XLSX analysis (multipart field `file`)
-- `POST /api/explain` — authenticated optional Ollama/Gemma explanation of aggregate metrics
+- `POST /api/payment-risk/upload` — authenticated experimental payment-risk estimates and holdout benchmark (multipart field `file`)
+- `POST /api/explain` — authenticated local Ollama/Gemma brief from allowlisted aggregate metrics
 
 Interactive API docs: `http://localhost:8000/docs`.
 
@@ -82,14 +113,23 @@ Interactive API docs: `http://localhost:8000/docs`.
 
 - Expected inflows are the sum of unpaid invoices with due dates within the next 30 days, not a probability-weighted forecast.
 - Payment-delay summaries are descriptive and use only paid invoices with valid `paid_date` values.
+- The separate experimental payment-risk scores are uncalibrated model outputs, require sufficient labeled payment history, and are not probabilities or guarantees of payment.
 - Small samples can be misleading. This MVP does not provide financial, accounting, or tax advice.
+
+## Challenge demo checklist
+
+- Run a locally installed Gemma model through Ollama; do not use the `gemma4:cloud` model when demonstrating local inference.
+- Upload a real invoice export or the included sample CSV; distinguish sample data from real client data in the demo.
+- Show that deterministic totals are calculated before Gemma's generated interpretation.
+- Explain the privacy boundary: show that the server reduces analytics to qualitative flags before making the local request, and that the model selects only allowlisted focus/action IDs; do not stage or label a canned response as live output.
+- Include the public source repository, a working demo link, why open-weight/local inference matters for freelancer invoice privacy, and first-user feedback if available in the DEV submission.
 
 ## Next steps
 
 - Add tests for auth, file parsing, analytics, and malformed spreadsheets
 - Add column mapping and more export-specific header aliases
 - Add robust rate limiting, secure session management, and account recovery before public deployment
-- Benchmark TabPFN against a transparent baseline on a suitable tabular payment-delay task
+- Validate experimental payment-risk estimates on representative historical data
 - Gather real first-user feedback with consent
 
 ## License
