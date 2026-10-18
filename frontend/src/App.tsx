@@ -308,6 +308,7 @@ function App() {
     const requestId = ++aiRequestId.current;
     setAiBusy(true);
     setAiBrief(null);
+    setAiModel("");
     setAiError("");
     try {
       const r = await fetch(`${API}/api/explain`, {
@@ -333,7 +334,7 @@ function App() {
       if (!r.ok) {
         throw new Error(
           body.detail ||
-            "Local Gemma is unavailable. Start Ollama and check its model configuration.",
+            "Gemma is unavailable. Check the configured Ollama service and try again.",
         );
       }
       if (
@@ -345,11 +346,11 @@ function App() {
           (recommendation: unknown) => typeof recommendation === "string",
         ) ||
         typeof body.model !== "string" ||
-        body.local_inference !== true ||
+        typeof body.local_inference !== "boolean" ||
         typeof body.notice !== "string"
       ) {
         throw new Error(
-          "Local Gemma returned an invalid brief. Try generating it again.",
+          "Gemma returned an invalid brief. Try generating it again.",
         );
       }
       setAiBrief({
@@ -366,7 +367,7 @@ function App() {
         setAiError(
           err instanceof Error
             ? err.message
-            : "Local Gemma could not generate a cash-flow brief.",
+            : "Gemma could not generate a cash-flow brief.",
         );
       }
     } finally {
@@ -390,7 +391,7 @@ function App() {
           </div>
           <div className="auth-copy">
             <div className="eyebrow">
-              <span className="eyebrow-line" /> LOCAL GEMMA · PRIVATE BY DESIGN
+              <span className="eyebrow-line" /> OPEN-WEIGHT GEMMA · PRIVACY BY DESIGN
             </div>
             <h1>
               A calmer way to
@@ -642,7 +643,7 @@ function App() {
           <section className="welcome-row">
             <div>
               <div className="eyebrow">
-                <span className="eyebrow-line" /> LOCAL GEMMA · YOUR CASH-FLOW COPILOT
+                <span className="eyebrow-line" /> GEMMA · YOUR CASH-FLOW COPILOT
               </div>
               <h1>
                 Clear numbers.
@@ -650,8 +651,8 @@ function App() {
                 <em>Smarter next steps.</em>
               </h1>
               <p className="welcome-sub">
-                Upload real invoices for a verified financial snapshot and a
-                local Gemma brief. Only qualitative signals derived from
+                Upload invoices for a verified financial snapshot and a
+                Gemma brief. Only qualitative signals derived from
                 aggregate analytics—not client names or invoice rows—reach your
                 configured Ollama model.
               </p>
@@ -832,7 +833,7 @@ function App() {
                   <div className="ai-brief-heading">
                     <div>
                       <div className="section-kicker">
-                        LOCAL GEMMA · QUALITATIVE SIGNALS ONLY
+                        GEMMA · QUALITATIVE SIGNALS ONLY
                       </div>
                       <h2 id="ai-brief-heading">
                         Your AI cash-flow brief
@@ -841,7 +842,7 @@ function App() {
                     {aiModel && (
                       <span className="ai-model-badge">
                         <span className="green-dot" />
-                        {aiModel} · local
+                        {aiModel} · {aiBrief?.local_inference === false ? "remote gateway" : "local"}
                       </span>
                     )}
                   </div>
@@ -865,7 +866,7 @@ function App() {
                       </>
                     ) : aiError ? (
                       <div className="ai-brief-error" role="alert">
-                        <b>Local Gemma could not generate the brief.</b>
+                        <b>Gemma could not generate the brief.</b>
                         <span>{aiError}</span>
                         <span>
                           Your uploaded invoice analytics are still available

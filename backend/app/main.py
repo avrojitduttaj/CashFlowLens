@@ -6,11 +6,13 @@ import hmac
 import io
 import ipaddress
 import json
+import logging
 import math
 import os
 import secrets
 import sqlite3
 import time
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from app.payment_risk import (
 )
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.getenv("CASHFLOWLENS_DB", str(ROOT / "cashflowlens.sqlite3")))
 TOKEN_SECRET = os.getenv("CASHFLOWLENS_TOKEN_SECRET", "dev-only-change-this-secret-before-deploying").encode()
@@ -70,7 +73,7 @@ ACTION_LABELS = {
 
 
 def sanitize_explanation_summary(summary: dict[str, Any]) -> dict[str, Any]:
-    """Reduce verified aggregates to qualitative signals before local inference."""
+    """Reduce verified aggregates to qualitative signals before model inference."""
     def is_finite_number(value: Any) -> bool:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return False
@@ -112,45 +115,119 @@ def sanitize_explanation_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return safe_summary
 
 
-def local_gemma_configuration(base_url: str, model: str) -> tuple[str, str]:
-    """Reject hosted endpoints and cloud aliases before sending financial signals."""
+@dataclass(frozen=True)
+class OllamaConfiguration:
+    base_url: str
+    model: str
+    local_inference: bool
+    api_key: str | None = field(default=None, repr=False)
+
+    @property
+    def headers(self) -> dict[str, str]:
+        if self.local_inference or self.api_key is None:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+
+def ollama_configuration(
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    environment: str,
+) -> OllamaConfiguration:
+    """Allow loopback HTTP or explicitly enabled, authenticated remote HTTPS."""
+    base_url = base_url.strip().rstrip("/")
     try:
         parsed = urlsplit(base_url)
         hostname = parsed.hostname or ""
         port = parsed.port
-        loopback = hostname.lower() == "localhost"
+        normalized_hostname = hostname.casefold()
+        loopback = (
+            normalized_hostname == "localhost"
+            or normalized_hostname.endswith(".localhost")
+        )
         if not loopback:
-            loopback = ipaddress.ip_address(hostname).is_loopback
+            try:
+                loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                loopback = False
     except ValueError:
         loopback = False
         parsed = None
         port = None
 
+    if parsed is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama configuration is invalid. Check the server configuration.",
+        )
+
+    model_is_supported = (
+        bool(model)
+        and len(model) <= 100
+        and "gemma" in model.casefold()
+        and "cloud" not in model.casefold()
+        and not any(character.isspace() for character in model)
+    )
+    url_is_safe = (
+        bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and "\\" not in base_url
+        and not any(character.isspace() for character in base_url)
+    )
+
+    if not url_is_safe or not model_is_supported:
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama configuration is invalid. Check the server configuration.",
+        )
+
+    if loopback:
+        if (
+            parsed.scheme != "http"
+            or parsed.path not in ("", "/")
+            or port is None
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Local Ollama must use loopback HTTP with an explicit port "
+                    "and no URL path, query, or fragment."
+                ),
+            )
+        return OllamaConfiguration(
+            base_url=base_url,
+            model=model,
+            local_inference=True,
+        )
+
+    remote_key = api_key.strip() if api_key else ""
     if (
-        parsed is None
-        or parsed.scheme != "http"
-        or not loopback
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in ("", "/")
-        or parsed.query
-        or parsed.fragment
-        or port is None
-        or not model
-        or len(model) > 100
-        or "gemma" not in model.casefold()
-        or "cloud" in model.casefold()
-        or any(character.isspace() for character in model)
+        environment.strip().casefold() != "production"
+        or parsed.scheme != "https"
+        or normalized_hostname.endswith(".localhost")
+        or any(part in (".", "..") for part in parsed.path.split("/"))
+        or parsed.path.casefold().endswith("/api/generate")
+        or not remote_key
+        or any(ord(character) < 33 or ord(character) > 126 for character in remote_key)
     ):
         raise HTTPException(
             status_code=503,
             detail=(
-                "CashFlowLens requires a local Gemma model. Set "
-                "OLLAMA_BASE_URL to a loopback HTTP address and OLLAMA_MODEL "
-                "to a locally installed Gemma model; cloud model aliases are disabled."
+                "Remote Ollama requires CASHFLOWLENS_ENV=production, a valid "
+                "HTTPS Ollama gateway URL, a non-cloud Gemma model, and "
+                "OLLAMA_API_KEY. Configure the gateway on the backend only."
             ),
         )
-    return base_url, model
+    return OllamaConfiguration(
+        base_url=base_url,
+        model=model,
+        local_inference=False,
+        api_key=remote_key,
+    )
 
 
 def cashflow_plan_context(summary: dict[str, Any]) -> dict[str, Any]:
@@ -432,11 +509,14 @@ async def analytics_upload(file: UploadFile = File(...), user: AuthUser = Depend
 async def explain(
     request: ExplainRequest, user: AuthUser = Depends(current_user)
 ) -> dict[str, Any]:
-    """Use local Gemma to prioritize verified invoice actions, not financial facts."""
-    base_url, model = local_gemma_configuration(
+    """Use configured Gemma to prioritize verified invoice actions, not facts."""
+    config = ollama_configuration(
         os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/"),
         request.model or os.getenv("OLLAMA_MODEL", "gemma3:4b"),
+        os.getenv("OLLAMA_API_KEY"),
+        os.getenv("CASHFLOWLENS_ENV", "development"),
     )
+    request_headers = config.headers
     context = cashflow_plan_context(request.summary)
     format_schema = {
         "type": "object",
@@ -478,18 +558,25 @@ async def explain(
     )
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(300.0, connect=10.0),
+            timeout=httpx.Timeout(
+                300.0,
+                connect=10.0,
+                write=10.0,
+                pool=10.0,
+            ),
             trust_env=False,
+            follow_redirects=False,
         ) as client:
             response = await client.post(
-                f"{base_url}/api/generate",
+                f"{config.base_url}/api/generate",
                 json={
-                    "model": model,
+                    "model": config.model,
                     "prompt": prompt,
                     "stream": False,
                     "format": format_schema,
                     "options": {"temperature": 0, "num_predict": 100},
                 },
+                headers=request_headers,
             )
             response.raise_for_status()
             try:
@@ -499,11 +586,27 @@ async def explain(
                     status_code=502,
                     detail="Ollama returned malformed response data. Try again.",
                 ) from exc
-    except httpx.HTTPError as exc:
-        print(f"Ollama HTTP error: {type(exc).__name__}: {exc}", flush=True)
+    except httpx.TimeoutException as exc:
+        logger.warning("Ollama request timed out (%s).", type(exc).__name__)
         raise HTTPException(
             status_code=503,
-            detail=f"Ollama request failed: {type(exc).__name__}: {exc}",
+            detail="Ollama request timed out. Try again later.",
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "Ollama gateway returned HTTP %s.", exc.response.status_code
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama gateway rejected or failed the request.",
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Ollama transport request failed (%s).", type(exc).__name__
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Ollama is unavailable. Check the configured inference service.",
         ) from exc
     if not isinstance(payload, dict):
         raise HTTPException(
@@ -527,14 +630,20 @@ async def explain(
         parsed_plan, context["focus_options"], context["actions_by_focus"]
     )
     return {
-        "model": model,
+        "model": config.model,
         "focus": focus,
         "headline": FOCUS_LABELS[focus],
         "recommendations": [ACTION_LABELS[action] for action in actions],
-        "local_inference": True,
+        "local_inference": config.local_inference,
         "notice": (
-            "Local Gemma selected these actions from verified cash-flow signals. "
-            "Review invoices and dates before acting; this is not financial advice."
+            (
+                "Local Gemma selected these actions from verified cash-flow "
+                "signals."
+                if config.local_inference
+                else "The configured Gemma gateway selected these actions "
+                "from verified cash-flow signals."
+            )
+            + " Review invoices and dates before acting; this is not financial advice."
         ),
     }
 

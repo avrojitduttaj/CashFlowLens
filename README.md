@@ -1,10 +1,10 @@
-# CashFlowLens — your local AI cash-flow copilot
+# CashFlowLens — your privacy-first AI cash-flow copilot
 
-**Turn invoice totals into grounded next steps with Gemma running on your machine.**
+**Turn invoice totals into grounded next steps with local or securely hosted Gemma.**
 
-CashFlowLens is a local-first cash-flow copilot for freelancers and small agencies. Upload a real CSV or Excel invoice export: deterministic analytics calculate receivables and due-date-based inflows, then a local open-weight Gemma model automatically turns privacy-filtered aggregates into a concise cash-flow brief and practical follow-ups. AI interpretation is the product's core workflow; the model does not calculate or change financial totals.
+CashFlowLens is a privacy-first cash-flow copilot for freelancers and small agencies. Upload a CSV or Excel invoice export: deterministic analytics calculate receivables and due-date-based inflows, then an open-weight Gemma model turns privacy-filtered aggregates into a concise cash-flow brief and practical follow-ups. AI interpretation is the product's core workflow; the model does not calculate or change financial totals.
 
-The API reduces verified totals and payment history to qualitative state signals before sending them to the local model; exact amounts, counts, client names, invoice identifiers, contact details, dates, and raw invoice rows are excluded from the prompt. Gemma selects only from server-allowlisted focus and action IDs, and the server renders the final brief from fixed text rather than trusting free-form model claims. Inference is restricted to loopback Ollama addresses and cloud model aliases are rejected. Invoice uploads are analyzed in request memory and are not persisted by the API.
+The API reduces verified totals and payment history to qualitative state signals before sending them to Ollama; exact amounts, counts, client names, invoice identifiers, contact details, dates, and raw invoice rows are excluded from the prompt. Gemma selects only from server-allowlisted focus and action IDs, and the server renders the final brief from fixed text rather than trusting free-form model claims. Local Ollama remains the default. A remote HTTPS Ollama-compatible gateway is allowed only when the backend is explicitly configured for production and has a backend-only API key. Invoice uploads are analyzed in request memory and are not persisted by the API.
 
 ## How it works
 
@@ -14,13 +14,13 @@ flowchart LR
     B --> C[Deterministic analytics and validation]
     C --> D[React cash-flow dashboard]
     C --> E[Derive qualitative signals]
-    E --> F[Local Ollama + open-weight Gemma]
+    E --> F[Local Ollama or authenticated HTTPS gateway + open-weight Gemma]
     F --> G[Grounded cash-flow brief and next steps]
     G --> D
     B --> H[(SQLite user accounts only)]
 ```
 
-Gemma contributes the interpretation and next-step brief after every successful upload; it is not a decorative chatbot or cloud API call. Deterministic calculations remain the financial source of truth. The API derives qualitative signals server-side and sends only those signals to the configured local Ollama runtime.
+Gemma contributes the interpretation and next-step brief after every successful upload; it is not a decorative chatbot. Deterministic calculations remain the financial source of truth. The API derives qualitative signals server-side and sends only those signals to the configured Ollama service. In remote mode, the backend sends `Authorization: Bearer <OLLAMA_API_KEY>` directly to the HTTPS gateway; the frontend never receives the key.
 
 > **MVP/security note:** This is a development prototype, not production-ready financial software. Authentication uses a custom signed bearer token and PBKDF2 password hashes. Set a strong `CASHFLOWLENS_TOKEN_SECRET`, use HTTPS, add rate limiting, CSRF-safe deployment architecture, account recovery, and security review before public launch. Do not upload real financial data to a public deployment until its data handling has been reviewed.
 
@@ -31,14 +31,14 @@ Gemma contributes the interpretation and next-step brief after every successful 
 - Authenticated CSV / XLSX / XLS upload (8 MB limit)
 - Server-side schema validation and deterministic invoice analytics
 - Dynamic dashboard based on the uploaded file, not hardcoded sample metrics
-- Automatic local Gemma cash-flow brief after each successful invoice upload
+- Automatic Gemma cash-flow brief after each successful invoice upload, using local or explicitly configured production inference
 - Qualitative prompt allowlist: exact amounts, client names, and invoice-level data never reach the model; structured model choices are allowlisted and rendered as vetted copy
-- Clear local-model loading, retry, and unavailable states; deterministic accounting stays visible if Ollama is offline
+- Clear model loading, retry, and unavailable states; deterministic accounting stays visible if Ollama is offline
 - Expected inflows by due date for the next 30 days
 - Client payment-delay summaries based on paid invoices with a paid date
 - Optional experimental payment-risk estimates for unpaid invoices, based on labeled history in the uploaded file
 - Follow-up email drafts for unpaid invoices
-- Local Gemma explanation endpoint, using qualitative signals rather than raw invoice rows and requiring a loopback Ollama endpoint
+- Gemma explanation endpoint, using qualitative signals rather than raw invoice rows; local mode is loopback-only and remote mode requires production HTTPS plus a backend API key
 - Invoice file content is analyzed in request memory and is not saved by the API; user accounts are stored in SQLite
 
 ## Run locally
@@ -81,7 +81,22 @@ ollama pull gemma3:4b
 
 Ollama's default address is `http://127.0.0.1:11434`; the API uses `gemma3:4b` unless configured otherwise. To customize, set `OLLAMA_BASE_URL` and `OLLAMA_MODEL` in `backend/.env` before starting the API. The AI brief runs automatically after each successful invoice upload and can be regenerated from the dashboard. If Ollama is unavailable, the UI reports the error and keeps the deterministic financial calculations available.
 
-The model runs locally; it is not bundled with this repository and must be downloaded before a complete demo. For a live demonstration, start Ollama and the API on the demo machine, upload the supplied sample CSV, and show the real generated brief alongside the deterministic figures. Do not present a mocked or prewritten AI response as live model output.
+The local model is not bundled with this repository and must be downloaded before a complete local demo. For a live demonstration, start Ollama and the API on the demo machine, upload the supplied sample CSV, and show the real generated brief alongside the deterministic figures. Do not present a mocked or prewritten AI response as live model output.
+
+### Hosted Ollama-compatible gateway (production only)
+
+Set these variables in the backend's production secret manager; keep the key out of source control and every frontend variable:
+
+```text
+CASHFLOWLENS_ENV=production
+OLLAMA_BASE_URL=https://your-ollama-gateway.example.com
+OLLAMA_MODEL=gemma3:4b
+OLLAMA_API_KEY=<provider-issued-secret>
+```
+
+`OLLAMA_BASE_URL` is a gateway base URL; the API appends `/api/generate`. Use a gateway that supports Ollama's generate API and JSON-schema `format` option. The backend sends the key only in its outbound `Authorization: Bearer ...` header. Remote mode is rejected unless production is explicitly enabled, the URL uses HTTPS, and a valid key is set; local mode remains the default (`http://127.0.0.1:11434`) and ignores any configured key. Do not expose Ollama port 11434 publicly—keep Ollama bound to a private interface behind a secured HTTPS gateway or reverse proxy.
+
+No production gateway URL or credential has been supplied, so remote inference has not been tested against a live provider. Validate the actual gateway URL, TLS, authentication, model availability, and structured-output support before relying on it. If inference is unavailable, deterministic invoice analytics remain available.
 
 ## File format
 
@@ -105,7 +120,7 @@ A sample file is available at `sample-data/invoices.csv` and through the app's u
 - `GET /api/auth/me` — current user (Bearer token)
 - `POST /api/analytics/upload` — authenticated CSV/XLSX analysis (multipart field `file`)
 - `POST /api/payment-risk/upload` — authenticated experimental payment-risk estimates and holdout benchmark (multipart field `file`)
-- `POST /api/explain` — authenticated local Ollama/Gemma brief from allowlisted aggregate metrics
+- `POST /api/explain` — authenticated Ollama/Gemma brief from allowlisted aggregate metrics
 
 Interactive API docs: `http://localhost:8000/docs`.
 
