@@ -56,6 +56,49 @@ type Analytics = {
   caveats: string[];
   invoices: Invoice[];
 };
+type RiskPrediction = {
+  invoice_id: string;
+  client: string;
+  amount: number;
+  due_date: string;
+  experimental_late_score: number;
+  label: string;
+  warning: string;
+};
+type RiskMetric = {
+  accuracy?: number;
+  balanced_accuracy?: number;
+  f1_late?: number;
+  roc_auc?: number | null;
+  status?: string;
+  reason?: string;
+};
+type PaymentResponse = {
+  benchmark: {
+    status: "ok" | "insufficient_data";
+    labeled_rows: number;
+    message?: string;
+    caveat?: string;
+    models?: Record<string, RiskMetric>;
+  };
+  payment_risk: {
+    status: "ok" | "insufficient_data" | "unavailable";
+    message?: string;
+    reason?: string;
+    labeled_rows?: number;
+    predictions: RiskPrediction[];
+    caveat?: string;
+  };
+  notice: string;
+};
+type CashflowBrief = {
+  model: string;
+  focus: string;
+  headline: string;
+  recommendations: string[];
+  local_inference: boolean;
+  notice: string;
+};
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const money = (n: number) =>
   new Intl.NumberFormat("en-US", {
@@ -89,9 +132,13 @@ function App() {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Invoice | null>(null);
   const [draftOpen, setDraftOpen] = useState(false);
-  const [aiText, setAiText] = useState("");
+  const [aiBrief, setAiBrief] = useState<CashflowBrief | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState("");
+  const [aiModel, setAiModel] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
+  const aiRequestId = useRef(0);
+  const riskRequestId = useRef(0);
   const [riskData, setRiskData] = useState<PaymentResponse | null>(null);
   const [riskBusy, setRiskBusy] = useState(false);
   const [riskError, setRiskError] = useState("");
@@ -114,12 +161,21 @@ function App() {
       });
   }, [token, requestHeaders]);
   const signOut = () => {
+    aiRequestId.current += 1;
+    riskRequestId.current += 1;
     localStorage.removeItem("cashflowlens_token");
     setToken("");
     setUser(null);
     setData(null);
     setFileName("");
-    setAiText("");
+    setAiBrief(null);
+    setAiError("");
+    setAiModel("");
+    setAiBusy(false);
+    setSourceFile(null);
+    setRiskBusy(false);
+    setRiskData(null);
+    setRiskError("");
   };
   const authenticate = async (e: FormEvent) => {
     e.preventDefault();
@@ -150,7 +206,6 @@ function App() {
     setError("");
     setToast("");
     setBusy(true);
-    setAiText("");
     try {
       const form = new FormData();
       form.append("file", file);
@@ -167,15 +222,61 @@ function App() {
       if (!r.ok) throw new Error(body.detail || "Could not analyze this file.");
       setData(body);
       setFileName(file.name);
+      setSourceFile(file);
+      aiRequestId.current += 1;
+      setAiBrief(null);
+      setAiError("");
+      setAiModel("");
+      setAiBusy(false);
+      riskRequestId.current += 1;
+      setRiskBusy(false);
+      setRiskData(null);
+      setRiskError("");
       setSelected(body.invoices.find((i: Invoice) => !i.paid) || null);
       setToast(
         `Analyzed ${body.invoice_count} invoice rows from ${file.name}.`,
       );
+      void explain(body);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed.");
     } finally {
       setBusy(false);
       if (fileRef.current) fileRef.current.value = "";
+    }
+  };
+  const analyzePaymentRisk = async () => {
+    if (!sourceFile) return;
+    const requestId = ++riskRequestId.current;
+    setRiskBusy(true);
+    setRiskError("");
+    setRiskData(null);
+    try {
+      const form = new FormData();
+      form.append("file", sourceFile);
+      const r = await fetch(`${API}/api/payment-risk/upload`, {
+        method: "POST",
+        headers: requestHeaders,
+        body: form,
+      });
+      const body = await r.json();
+      if (requestId !== riskRequestId.current) return;
+      if (r.status === 401) {
+        signOut();
+        throw new Error("Your session expired. Please log in again.");
+      }
+      if (!r.ok)
+        throw new Error(body.detail || "Could not analyze payment risk.");
+      if (requestId === riskRequestId.current) setRiskData(body);
+    } catch (err) {
+      if (requestId === riskRequestId.current) {
+        setRiskError(
+          err instanceof Error
+            ? err.message
+            : "Could not analyze payment risk.",
+        );
+      }
+    } finally {
+      if (requestId === riskRequestId.current) setRiskBusy(false);
     }
   };
   const unpaid = (data?.invoices || []).filter((i) => !i.paid);
@@ -190,25 +291,36 @@ function App() {
     amount: p.expected_inflow,
     count: p.invoice_count,
   }));
+  const riskByInvoice = useMemo(
+    () =>
+      new Map(
+        (riskData?.payment_risk.predictions || []).map((prediction) => [
+          prediction.invoice_id,
+          prediction,
+        ]),
+      ),
+    [riskData],
+  );
   const draft = selected
     ? `Subject: Quick follow-up on ${selected.invoice_id}\n\nHi ${selected.client},\n\nI hope you’re doing well. I’m checking in on invoice ${selected.invoice_id} for ${money(selected.amount)}, which was due on ${shortDate(selected.due_date)}. Could you let me know when I might expect payment, or if you need anything else from me?\n\nThanks so much,\n[Your name]`
     : "";
-  const explain = async () => {
-    if (!data) return;
+  const explain = async (analytics: Analytics) => {
+    const requestId = ++aiRequestId.current;
     setAiBusy(true);
-    setAiText("");
+    setAiBrief(null);
+    setAiError("");
     try {
       const r = await fetch(`${API}/api/explain`, {
         method: "POST",
         headers: { ...requestHeaders, "Content-Type": "application/json" },
         body: JSON.stringify({
           summary: {
-            invoice_count: data.invoice_count,
-            outstanding_total: data.outstanding_total,
-            overdue_total: data.overdue_total,
-            overdue_count: data.overdue_count,
-            expected_30_day_inflow: data.expected_30_day_inflow,
-            client_signals: data.client_signals.map((s) => ({
+            invoice_count: analytics.invoice_count,
+            outstanding_total: analytics.outstanding_total,
+            overdue_total: analytics.overdue_total,
+            overdue_count: analytics.overdue_count,
+            expected_30_day_inflow: analytics.expected_30_day_inflow,
+            client_signals: analytics.client_signals.map((s) => ({
               paid_invoice_count: s.paid_invoice_count,
               average_days_late: s.average_days_late,
               late_invoice_count: s.late_invoice_count,
@@ -217,14 +329,48 @@ function App() {
         }),
       });
       const body = await r.json();
-      if (!r.ok) throw new Error(body.detail || "AI explanation unavailable.");
-      setAiText(body.explanation);
+      if (requestId !== aiRequestId.current) return;
+      if (!r.ok) {
+        throw new Error(
+          body.detail ||
+            "Local Gemma is unavailable. Start Ollama and check its model configuration.",
+        );
+      }
+      if (
+        typeof body.headline !== "string" ||
+        typeof body.focus !== "string" ||
+        !Array.isArray(body.recommendations) ||
+        body.recommendations.length === 0 ||
+        !body.recommendations.every(
+          (recommendation: unknown) => typeof recommendation === "string",
+        ) ||
+        typeof body.model !== "string" ||
+        body.local_inference !== true ||
+        typeof body.notice !== "string"
+      ) {
+        throw new Error(
+          "Local Gemma returned an invalid brief. Try generating it again.",
+        );
+      }
+      setAiBrief({
+        model: body.model,
+        focus: body.focus,
+        headline: body.headline,
+        recommendations: body.recommendations,
+        local_inference: body.local_inference,
+        notice: body.notice,
+      });
+      setAiModel(body.model);
     } catch (err) {
-      setAiText(
-        err instanceof Error ? err.message : "AI explanation unavailable.",
-      );
+      if (requestId === aiRequestId.current) {
+        setAiError(
+          err instanceof Error
+            ? err.message
+            : "Local Gemma could not generate a cash-flow brief.",
+        );
+      }
     } finally {
-      setAiBusy(false);
+      if (requestId === aiRequestId.current) setAiBusy(false);
     }
   };
   if (!token || !user)
@@ -244,16 +390,16 @@ function App() {
           </div>
           <div className="auth-copy">
             <div className="eyebrow">
-              <span className="eyebrow-line" /> YOUR MONEY, IN FOCUS
+              <span className="eyebrow-line" /> LOCAL GEMMA · PRIVATE BY DESIGN
             </div>
             <h1>
-              Make room for
+              A calmer way to
               <br />
-              <em>what comes next.</em>
+              <em>read your cash flow.</em>
             </h1>
             <p>
-              Know what’s outstanding, spot payment patterns, and plan your next
-              move with more clarity.
+              Turn real invoice data into a clear, locally generated cash-flow
+              brief. Your client rows stay out of the model prompt.
             </p>
             <div className="auth-visual-card">
               <div className="mini-card-top">
@@ -496,17 +642,18 @@ function App() {
           <section className="welcome-row">
             <div>
               <div className="eyebrow">
-                <span className="eyebrow-line" /> YOUR MONEY, IN FOCUS
+                <span className="eyebrow-line" /> LOCAL GEMMA · YOUR CASH-FLOW COPILOT
               </div>
               <h1>
-                A clearer view of
+                Clear numbers.
                 <br />
-                <em>what comes next.</em>
+                <em>Smarter next steps.</em>
               </h1>
               <p className="welcome-sub">
-                Upload your invoices. CashFlowLens will validate the data and
-                calculate your outstanding balance, overdue payments, and
-                expected inflows.
+                Upload real invoices for a verified financial snapshot and a
+                local Gemma brief. Only qualitative signals derived from
+                aggregate analytics—not client names or invoice rows—reach your
+                configured Ollama model.
               </p>
             </div>
             <div className="welcome-actions">
@@ -527,15 +674,17 @@ function App() {
               />
             </div>
           </section>
-          <div className="data-note">
+          <div className="data-note" aria-busy={busy}>
             <div className="note-icon">
               <Fingerprint size={17} />
             </div>
             <div>
               <b>
-                {fileName
-                  ? "Currently analyzing your data"
-                  : "Your workspace is ready"}
+                {busy
+                  ? "Analyzing your file"
+                  : fileName
+                    ? "Last analyzed file"
+                    : "Your workspace is ready"}
               </b>
               <span>
                 {fileName
@@ -549,7 +698,7 @@ function App() {
             </button>
           </div>
           {error && (
-            <div className="upload-error">
+            <div className="upload-error" role="alert">
               <X size={17} />
               <div>
                 <b>We couldn't analyze that file</b>
@@ -672,6 +821,85 @@ function App() {
                   </div>
                 </article>
               </section>
+              <section
+                className="panel ai-panel ai-core-panel"
+                aria-labelledby="ai-brief-heading"
+              >
+                <div className="ai-panel-icon">
+                  <Sparkles size={19} />
+                </div>
+                <div className="ai-panel-body">
+                  <div className="ai-brief-heading">
+                    <div>
+                      <div className="section-kicker">
+                        LOCAL GEMMA · QUALITATIVE SIGNALS ONLY
+                      </div>
+                      <h2 id="ai-brief-heading">
+                        Your AI cash-flow brief
+                      </h2>
+                    </div>
+                    {aiModel && (
+                      <span className="ai-model-badge">
+                        <span className="green-dot" />
+                        {aiModel} · local
+                      </span>
+                    )}
+                  </div>
+                  <p className="ai-brief-description">
+                    Every invoice upload triggers Gemma to interpret
+                    qualitative cash-flow signals and suggest practical
+                    follow-ups. Verified figures remain deterministic; the
+                    model adds context, not accounting guesses.
+                  </p>
+                  <div
+                    className={`ai-brief-content ${aiBusy ? "is-loading" : ""}`}
+                    aria-live="polite"
+                    aria-busy={aiBusy}
+                  >
+                    {aiBusy ? (
+                      <>
+                        <span className="loading-dot" />
+                        <span>
+                          Gemma is preparing a brief from aggregate figures…
+                        </span>
+                      </>
+                    ) : aiError ? (
+                      <div className="ai-brief-error" role="alert">
+                        <b>Local Gemma could not generate the brief.</b>
+                        <span>{aiError}</span>
+                        <span>
+                          Your uploaded invoice analytics are still available
+                          above.
+                        </span>
+                      </div>
+                    ) : aiBrief ? (
+                      <div className="ai-result">
+                        <h3>{aiBrief.headline}</h3>
+                        <ul>
+                          {aiBrief.recommendations.map((recommendation) => (
+                            <li key={recommendation}>{recommendation}</li>
+                          ))}
+                        </ul>
+                        <p>{aiBrief.notice}</p>
+                      </div>
+                    ) : (
+                      <span>
+                        Upload a real invoice file to generate your first
+                        private brief.
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  className="secondary-btn ai-regenerate"
+                  onClick={() => void explain(data)}
+                  disabled={aiBusy || busy}
+                  aria-busy={aiBusy}
+                >
+                  <Sparkles size={15} />
+                  {aiBusy ? "Generating brief…" : "Regenerate with Gemma"}
+                </button>
+              </section>
               <section className="panel-grid" id="forecast">
                 <article className="panel chart-panel">
                   <div className="panel-heading">
@@ -700,12 +928,12 @@ function App() {
                             >
                               <stop
                                 offset="0%"
-                                stopColor="#7ab69b"
+                                stopColor="#4277e8"
                                 stopOpacity={0.25}
                               />
                               <stop
                                 offset="95%"
-                                stopColor="#7ab69b"
+                                stopColor="#4277e8"
                                 stopOpacity={0.01}
                               />
                             </linearGradient>
@@ -713,18 +941,18 @@ function App() {
                           <CartesianGrid
                             strokeDasharray="3 5"
                             vertical={false}
-                            stroke="#e8ece8"
+                            stroke="#e4eaf3"
                           />
                           <XAxis
                             dataKey="date"
                             axisLine={false}
                             tickLine={false}
-                            tick={{ fill: "#89938d", fontSize: 11 }}
+                            tick={{ fill: "#667891", fontSize: 11 }}
                           />
                           <YAxis
                             axisLine={false}
                             tickLine={false}
-                            tick={{ fill: "#89938d", fontSize: 11 }}
+                            tick={{ fill: "#667891", fontSize: 11 }}
                             tickFormatter={(v) =>
                               `$${v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v}`
                             }
@@ -734,7 +962,7 @@ function App() {
                             type="monotone"
                             dataKey="amount"
                             name="Expected inflow"
-                            stroke="#43876b"
+                            stroke="#2459d8"
                             strokeWidth={2.5}
                             fill="url(#cashFill)"
                           />
@@ -819,6 +1047,184 @@ function App() {
                   </p>
                 </article>
               </section>
+              <section
+                className="panel risk-panel"
+                aria-labelledby="risk-heading"
+              >
+                <div className="panel-heading risk-heading">
+                  <div>
+                    <div className="section-kicker">OPTIONAL · EXPERIMENTAL</div>
+                    <h2 id="risk-heading">Payment risk signals</h2>
+                    <p className="risk-description">
+                      Compare unpaid invoices with payment patterns in this
+                      file's history. Analysis runs only when you request it.
+                    </p>
+                  </div>
+                  <button
+                    className="secondary-btn compact"
+                    onClick={analyzePaymentRisk}
+                    disabled={!sourceFile || busy || riskBusy}
+                    aria-busy={riskBusy}
+                  >
+                    <Activity size={15} />
+                    {riskBusy ? "Analyzing history…" : "Analyze payment risk"}
+                  </button>
+                </div>
+                <div className="risk-notice" role="note">
+                  <ShieldCheck size={16} />
+                  <span>
+                    Experimental model scores are uncalibrated estimates, not
+                    probabilities or guarantees of payment.
+                  </span>
+                </div>
+                {riskError && (
+                  <div className="upload-error" role="alert">
+                    <X size={17} />
+                    <div>
+                      <b>Payment-risk analysis is unavailable</b>
+                      <span>{riskError}</span>
+                    </div>
+                    <button
+                      aria-label="Dismiss payment-risk error"
+                      onClick={() => setRiskError("")}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                )}
+                {riskBusy ? (
+                  <div
+                    className="risk-state"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span className="loading-dot" />
+                    Evaluating historical payment data…
+                  </div>
+                ) : !sourceFile ? (
+                  <div className="risk-state">
+                    Upload an invoice file to make an optional risk analysis
+                    available.
+                  </div>
+                ) : !riskData ? (
+                  <div className="risk-state">
+                    No risk scores have been run for this file.
+                  </div>
+                ) : riskData.payment_risk.status !== "ok" ? (
+                  <div className="risk-state">
+                    <b>
+                      {riskData.payment_risk.status === "insufficient_data"
+                        ? "More labeled payment history is needed."
+                        : "The experimental model is unavailable."}
+                    </b>
+                    <span>
+                      {riskData.payment_risk.message ||
+                        riskData.benchmark.message ||
+                        riskData.payment_risk.reason ||
+                        "Use the deterministic invoice analytics above."}
+                    </span>
+                  </div>
+                ) : riskData.payment_risk.predictions.length === 0 ? (
+                  <div className="risk-state">
+                    No unpaid invoices were available to score.
+                  </div>
+                ) : (
+                  <>
+                    <div className="risk-results-heading">
+                      <b>
+                        {riskData.payment_risk.predictions.length} invoice
+                        {riskData.payment_risk.predictions.length === 1
+                          ? ""
+                          : "s"}{" "}
+                        assessed
+                      </b>
+                      <span>
+                        Based on {riskData.payment_risk.labeled_rows ?? 0}{" "}
+                        labeled historical invoices
+                      </span>
+                    </div>
+                    <div className="risk-results">
+                      {riskData.payment_risk.predictions.map((prediction) => {
+                        const score = Math.min(
+                          1,
+                          Math.max(0, prediction.experimental_late_score),
+                        );
+                        const higher =
+                          prediction.label === "higher relative score";
+                        return (
+                          <article
+                            className="risk-result"
+                            key={prediction.invoice_id}
+                          >
+                            <div className="risk-result-top">
+                              <div>
+                                <b>{prediction.client}</b>
+                                <small>{prediction.invoice_id}</small>
+                              </div>
+                              <span
+                                className={`risk-badge ${higher ? "risk-badge-high" : "risk-badge-low"}`}
+                              >
+                                <i />
+                                {higher
+                                  ? "Higher relative score"
+                                  : "Lower relative score"}
+                              </span>
+                            </div>
+                            <div className="risk-result-meta">
+                              <span>Due {shortDate(prediction.due_date)}</span>
+                              <b>{money(prediction.amount)}</b>
+                            </div>
+                            <div className="risk-score-label">
+                              <span>Experimental model score</span>
+                              <b>{Math.round(score * 100)}%</b>
+                            </div>
+                            <progress
+                              className={`risk-progress ${higher ? "risk-progress-high" : ""}`}
+                              max={1}
+                              value={score}
+                              aria-label={`${prediction.invoice_id}: experimental model score, not a probability`}
+                            />
+                            <small className="risk-warning">
+                              {prediction.warning}
+                            </small>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    {riskData.benchmark.status === "ok" &&
+                      riskData.benchmark.models && (
+                        <div className="risk-benchmark">
+                          <h3>Exploratory holdout benchmark</h3>
+                          <div className="risk-benchmark-grid">
+                            {Object.entries(riskData.benchmark.models).map(
+                              ([name, metrics]) =>
+                                metrics.balanced_accuracy !== undefined ? (
+                                  <div key={name}>
+                                    <span>
+                                      {name.replace(/_/g, " ")}
+                                    </span>
+                                    <b>
+                                      {Math.round(
+                                        metrics.balanced_accuracy * 100,
+                                      )}
+                                      %
+                                    </b>
+                                    <small>balanced accuracy</small>
+                                  </div>
+                                ) : null,
+                            )}
+                          </div>
+                          {riskData.benchmark.caveat && (
+                            <p>{riskData.benchmark.caveat}</p>
+                          )}
+                        </div>
+                      )}
+                    <p className="risk-disclaimer">
+                      {riskData.payment_risk.caveat || riskData.notice}
+                    </p>
+                  </>
+                )}
+              </section>
               <section className="panel invoice-panel" id="invoices">
                 <div className="panel-heading">
                   <div>
@@ -844,15 +1250,21 @@ function App() {
                     </button>
                   </div>
                 </div>
-                <div className="table-scroll">
+                <div
+                  className="table-scroll"
+                  role="region"
+                  tabIndex={0}
+                  aria-label="Scrollable unpaid invoices table"
+                >
                   <table>
                     <thead>
                       <tr>
-                        <th>Invoice / Client</th>
-                        <th>Due date</th>
-                        <th>Amount</th>
-                        <th>Status</th>
-                        <th>Action</th>
+                        <th scope="col">Invoice / Client</th>
+                        <th scope="col">Due date</th>
+                        <th scope="col">Amount</th>
+                        <th scope="col">Risk signal</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Action</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -867,6 +1279,23 @@ function App() {
                             </td>
                             <td>{shortDate(i.due_date)}</td>
                             <td className="amount-cell">{money(i.amount)}</td>
+                            <td>
+                              {riskByInvoice.has(i.invoice_id) ? (
+                                <span
+                                  className={`risk-badge risk-badge-table ${riskByInvoice.get(i.invoice_id)?.label === "higher relative score" ? "risk-badge-high" : "risk-badge-low"}`}
+                                >
+                                  <i />
+                                  {riskByInvoice.get(i.invoice_id)?.label ===
+                                  "higher relative score"
+                                    ? "Higher relative"
+                                    : "Lower relative"}
+                                </span>
+                              ) : (
+                                <span className="risk-not-assessed">
+                                  Not assessed
+                                </span>
+                              )}
+                            </td>
                             <td>
                               <span
                                 className={`status-pill ${late ? "status-late" : "status-pending"}`}
@@ -891,7 +1320,7 @@ function App() {
                       })}
                       {!rows.length && (
                         <tr>
-                          <td colSpan={5} className="empty-row">
+                          <td colSpan={6} className="empty-row">
                             No matching unpaid invoices.
                           </td>
                         </tr>
@@ -906,34 +1335,6 @@ function App() {
                   </span>
                   <span>{data.invoice_count} total rows analyzed</span>
                 </div>
-              </section>
-              <section className="panel ai-panel">
-                <div className="ai-panel-icon">
-                  <Sparkles size={19} />
-                </div>
-                <div className="ai-panel-body">
-                  <div className="section-kicker">LOCAL AI · OPTIONAL</div>
-                  <h2>Turn the numbers into next steps.</h2>
-                  <p>
-                    Once Ollama and Gemma are running locally, ask Gemma to
-                    explain these aggregate figures. Raw invoice rows aren't
-                    sent to the model.
-                  </p>
-                  {aiText && <div className="ai-result">{aiText}</div>}
-                </div>
-                <button
-                  className="secondary-btn"
-                  onClick={explain}
-                  disabled={aiBusy}
-                >
-                  {aiBusy ? (
-                    "Asking local Gemma…"
-                  ) : (
-                    <>
-                      <Sparkles size={15} /> Explain with Gemma
-                    </>
-                  )}
-                </button>
               </section>
               <section className="caveats">
                 <b>Read this before making decisions</b>

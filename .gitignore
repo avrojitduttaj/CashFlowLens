@@ -4,4 +4,5 @@ dist/
 __pycache__/
 *.py[cod]
 .env
+backend/cashflowlens.sqlite3
 .DS_Store
